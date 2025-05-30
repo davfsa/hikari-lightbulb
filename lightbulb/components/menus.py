@@ -988,7 +988,12 @@ class Menu(base.BuildableComponentContainer[special_endpoints.MessageActionRowBu
                 am.custom_ids = {c.custom_id: c for row in self._rows for c in row if not isinstance(c, LinkButton)}
 
         if timeout:
-            client._safe_create_task(self._run_menu(client, am, _handle_interaction, stop_event, timeout))
+            # Slight bodge allowing suppression of error logging from tasks if they are
+            # awaited before the execution completes.
+            client._safe_create_task(
+                self._run_menu(client, am, _handle_interaction, stop_event, timeout),
+                name="run menu with timeout @suppress",
+            )
         else:
             am.on_interaction = _handle_interaction
             client._attached_menus.add(am)

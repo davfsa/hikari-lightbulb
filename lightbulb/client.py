@@ -208,8 +208,8 @@ class Client(abc.ABC):
                 }
             )
 
-    def _safe_create_task(self, coro: Coroutine[None, None, T]) -> asyncio.Task[T]:
-        task = asyncio.create_task(coro)
+    def _safe_create_task(self, coro: Coroutine[None, None, T], *, name: str | None = None) -> asyncio.Task[T]:
+        task = asyncio.create_task(coro, name=name)
         self._asyncio_tasks.add(task)
         task.add_done_callback(self._handle_task_done)
         return task
