@@ -331,6 +331,7 @@ class MenuContext(base.MessageResponseMixinWithEdit[hikari.ComponentInteraction]
     """Class representing the context for an invocation of a component that belongs to a menu."""
 
     __slots__ = (
+        "_container",
         "_interaction",
         "_should_re_resolve_custom_ids",
         "_stop_event",
@@ -346,8 +347,9 @@ class MenuContext(base.MessageResponseMixinWithEdit[hikari.ComponentInteraction]
         menu: Menu,
         interaction: hikari.ComponentInteraction,
         component: base.BaseComponent[special_endpoints.MessageActionRowBuilder],
-        _timeout: async_timeout.Timeout,
+        _timeout: async_timeout.Timeout | None,
         _stop_event: asyncio.Event,
+        _container: _MenuInteractionHandlerContainer,
         _initial_response_sent: asyncio.Event,
     ) -> None:
         super().__init__(_initial_response_sent)
@@ -360,7 +362,8 @@ class MenuContext(base.MessageResponseMixinWithEdit[hikari.ComponentInteraction]
         self.component: base.BaseComponent[special_endpoints.MessageActionRowBuilder] = component
         """The component that triggered the interaction for this context."""
 
-        self._timeout: async_timeout.Timeout = _timeout
+        self._container: _MenuInteractionHandlerContainer = _container
+        self._timeout: async_timeout.Timeout | None = _timeout
         self._stop_event: asyncio.Event = _stop_event
         self._should_re_resolve_custom_ids: bool = False
 
@@ -391,6 +394,7 @@ class MenuContext(base.MessageResponseMixinWithEdit[hikari.ComponentInteraction]
 
     def stop_interacting(self) -> None:
         """Stop receiving interactions for the linked menu."""
+        self.client._attached_menus.discard(self._container)
         self._stop_event.set()
 
     def extend_timeout(self, length: float) -> None:
@@ -403,7 +407,9 @@ class MenuContext(base.MessageResponseMixinWithEdit[hikari.ComponentInteraction]
         Returns:
             :obj:`None`
         """
-        self._timeout.shift(length)
+        # TODO: Considering error here?
+        if self._timeout:
+            self._timeout.shift(length)
 
     def set_timeout(self, timeout: float) -> None:
         """
@@ -415,7 +421,9 @@ class MenuContext(base.MessageResponseMixinWithEdit[hikari.ComponentInteraction]
         Returns:
             :obj:`None`
         """
-        self._timeout.update(asyncio.get_running_loop().time() + timeout)
+        # TODO: Considering error here?
+        if self._timeout:
+            self._timeout.update(asyncio.get_running_loop().time() + timeout)
 
     def selected_values_for(self, select: Select[T]) -> Sequence[T]:
         """
@@ -569,16 +577,15 @@ class MenuHandle:
     to block until the menu completes.
     """
 
-    __slots__ = ("_task",)
+    __slots__ = ("_event",)
 
-    def __init__(self, task: asyncio.Task[None]) -> None:
-        self._task = task
+    def __init__(self, event: asyncio.Event) -> None:
+        self._event = event
 
     def __await__(self) -> Generator[None, t.Any, None]:
         # Slight bodge allowing suppression of error logging from tasks if they are
         # awaited before the execution completes.
-        self._task.set_name(self._task.get_name() + "@suppress")
-        return self._task.__await__()
+        return self._event.wait().__await__()
 
     def stop_interacting(self) -> None:
         """
@@ -587,7 +594,7 @@ class MenuHandle:
         Returns:
             :obj:`None`
         """
-        self._task.cancel()
+        self._event.set()
 
 
 class _MenuInteractionHandlerContainer:
@@ -902,48 +909,22 @@ class Menu(base.BuildableComponentContainer[special_endpoints.MessageActionRowBu
             )
         )
 
-    async def _run_menu(self, client: client_.Client, timeout: float | None) -> None:
-        am = _MenuInteractionHandlerContainer(
-            {c.custom_id: c for row in self._rows for c in row if not isinstance(c, LinkButton)}
-        )
-
-        stop_event = asyncio.Event()
-        ctx = contextvars.copy_context()
-
-        async def _handle_interaction(
-            interaction: hikari.ComponentInteraction, initial_response_sent: asyncio.Event, *, tm: async_timeout.Timeout
-        ) -> None:
-            context = MenuContext(
-                client=client,
-                menu=self,
-                interaction=interaction,
-                component=am.custom_ids[interaction.custom_id],
-                _timeout=tm,
-                _stop_event=stop_event,
-                _initial_response_sent=initial_response_sent,
-            )
-
-            token = linkd.DI_CONTAINER.set(ctx.get(linkd.DI_CONTAINER))
-            try:
-                if not await self.predicate(context):
-                    return
-
-                callback: t.Callable[[MenuContext], t.Awaitable[None]] = getattr(context.component, "callback")
-                await callback(context)
-            finally:
-                linkd.DI_CONTAINER.reset(token)
-
-            if context._should_re_resolve_custom_ids:
-                am.custom_ids = {c.custom_id: c for row in self._rows for c in row if not isinstance(c, LinkButton)}
-
+    async def _run_menu(
+        self,
+        client: client_.Client,
+        am: _MenuInteractionHandlerContainer,
+        handle_func: t.Callable[..., t.Any],
+        stop_event: asyncio.Event,
+        timeout: float | None,
+    ) -> None:
         try:
             async with async_timeout.timeout(timeout) as tm:
-                am.on_interaction = functools.partial(_handle_interaction, tm=tm)
+                am.on_interaction = functools.partial(handle_func, tm=tm)
                 client._attached_menus.add(am)
 
                 await stop_event.wait()
         finally:
-            client._attached_menus.remove(am)
+            client._attached_menus.discard(am)
 
     async def attach(
         self,
@@ -969,8 +950,50 @@ class Menu(base.BuildableComponentContainer[special_endpoints.MessageActionRowBu
             :obj:`asyncio.TimeoutError`: If the timeout is exceeded, and ``wait=True``. If you wait on the returned
                 awaitable instead, the error will be raised from that statement.
         """
-        task = client._safe_create_task(self._run_menu(client, timeout))
-        wrapped = MenuHandle(task)
+        am = _MenuInteractionHandlerContainer(
+            {c.custom_id: c for row in self._rows for c in row if not isinstance(c, LinkButton)}
+        )
+
+        ctx = contextvars.copy_context()
+        stop_event = asyncio.Event()
+
+        async def _handle_interaction(
+            interaction: hikari.ComponentInteraction,
+            initial_response_sent: asyncio.Event,
+            *,
+            tm: async_timeout.Timeout | None = None,
+        ) -> None:
+            context = MenuContext(
+                client=client,
+                menu=self,
+                interaction=interaction,
+                component=am.custom_ids[interaction.custom_id],
+                _container=am,
+                _timeout=tm,
+                _stop_event=stop_event,
+                _initial_response_sent=initial_response_sent,
+            )
+
+            token = linkd.DI_CONTAINER.set(ctx.get(linkd.DI_CONTAINER))
+            try:
+                if not await self.predicate(context):
+                    return
+
+                callback: t.Callable[[MenuContext], t.Awaitable[None]] = getattr(context.component, "callback")
+                await callback(context)
+            finally:
+                linkd.DI_CONTAINER.reset(token)
+
+            if context._should_re_resolve_custom_ids:
+                am.custom_ids = {c.custom_id: c for row in self._rows for c in row if not isinstance(c, LinkButton)}
+
+        if timeout:
+            client._safe_create_task(self._run_menu(client, am, _handle_interaction, stop_event, timeout))
+        else:
+            am.on_interaction = _handle_interaction
+            client._attached_menus.add(am)
+
+        wrapped = MenuHandle(stop_event)
 
         if wait:
             await wrapped
