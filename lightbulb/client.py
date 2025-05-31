@@ -1101,6 +1101,11 @@ class Client(abc.ABC):
         options, command = out
         context = self.build_command_context(interaction, options or [], command, initial_response_sent)
         LOGGER.debug("invoking command - %r", command._command_data.qualified_name)
+
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.set_name(f"command handler for {command._command_data.qualified_name!r}")
+
         await self._execute_command_context(context)
 
     async def handle_component_interaction(
